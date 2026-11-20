@@ -1,0 +1,131 @@
+{
+  "manifestVersion": 2,
+  "id": "redmine-tasks",
+  "name": "Redmine",
+  "version": "0.3.0",
+  "description": "Задачи Redmine, назначенные на вас, в боковой панели Orca: поиск по номеру, уведомления о новых и запуск агента по задаче.",
+  "author": {
+    "name": "Алексей Бухвин"
+  },
+  "engines": {
+    "orca": ">=1.4.261"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "issues",
+        "title": "Redmine",
+        "icon": "flag",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "redmine.refresh",
+        "title": "Redmine: обновить задачи"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "redmine",
+        "text": "Redmine",
+        "icon": "flag",
+        "tooltip": "Задачи Redmine",
+        "command": "redmine.refresh"
+      }
+    ],
+    "settings": [
+      {
+        "key": "textFormat",
+        "title": "Разметка текста в Redmine",
+        "description": "Как в Redmine: Администрирование → Настройки → Общие → Форматирование текста.",
+        "type": "string",
+        "default": "textile",
+        "enum": ["textile", "markdown"],
+        "enumLabels": ["Textile", "Markdown / CommonMark"]
+      },
+      {
+        "key": "projectFolder",
+        "title": "Папка проекта",
+        "description": "Имя Git-проекта (папки репозитория) в Orca. В нём «Взять в работу» создаёт worktree задачи, а его worktree с номером задачи в имени папки или ветки считаются workspace задачи. Пусто — worktree создаётся в проекте открытого сейчас workspace.",
+        "type": "string",
+        "default": "",
+        "placeholder": "my-project"
+      },
+      {
+        "key": "agent",
+        "title": "Агент",
+        "type": "string",
+        "default": "claude",
+        "enum": ["claude", "codex", "opencode"],
+        "enumLabels": ["Claude Code", "Codex", "OpenCode"]
+      },
+      {
+        "key": "startPrompt",
+        "title": "Промпт: взять в работу",
+        "description": "Отправляется агенту в новом worktree по кнопке «Взять в работу». Подстановки: {id} — номер, {subject} — тема, {url} — ссылка на задачу. Можно указать команду агента, например /my-skill {id}.",
+        "type": "string",
+        "default": "Возьми в работу задачу Redmine #{id} «{subject}»: {url}. Разберись в ней и предложи план работ."
+      },
+      {
+        "key": "continuePrompt",
+        "title": "Промпт: продолжить",
+        "description": "Отправляется агенту по кнопке «Продолжить» в workspace задачи, если он уже есть. Подстановки те же: {id}, {subject}, {url}.",
+        "type": "string",
+        "default": "Продолжи работу над задачей Redmine #{id} «{subject}»: {url}."
+      },
+      {
+        "key": "worktreeName",
+        "title": "Имя worktree",
+        "description": "Имя нового worktree и его ветки. {id} — номер задачи.",
+        "type": "string",
+        "default": "{id}",
+        "placeholder": "task-{id}"
+      },
+      {
+        "key": "baseBranch",
+        "title": "Базовая ветка",
+        "description": "От какой ветки создавать worktree. Пусто — как решит Orca (обычно основная ветка проекта).",
+        "type": "string",
+        "default": "",
+        "placeholder": "master"
+      },
+      {
+        "key": "skipSetup",
+        "title": "Пропускать setup-скрипт",
+        "description": "Не запускать setup-скрипт проекта при создании worktree.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "pollMinutes",
+        "title": "Проверять новые задачи, минут",
+        "description": "0 — не проверять в фоне.",
+        "type": "integer",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 120
+      },
+      {
+        "key": "notifyNew",
+        "title": "Уведомлять о новых задачах",
+        "type": "boolean",
+        "default": true
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "secrets:own" },
+    { "kind": "settings:own" },
+    { "kind": "notifications:show" },
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "workspace:create" },
+    { "kind": "agent:launch" }
+  ]
+}

@@ -54,6 +54,11 @@ export type RedmineDetails = {
   /** All comments the issue has, when more than `comments` holds. */
   commentsTotal: number
   attachments: number
+  /**
+   * Statuses Redmine's workflow lets the key's owner set, the current one included; empty when
+   * they may not change it, null when Redmine is older than 5.0 and does not say.
+   */
+  allowedStatuses: RedmineStatus[] | null
 }
 
 /** An issue status as Redmine lists it in Administration → Issue statuses. */
@@ -88,6 +93,14 @@ declare module 'orca' {
     'redmine.issues': { input: { force?: boolean }; output: RedmineSnapshot }
     /** Any issue by number with description and comments: the card and the search box. */
     'redmine.details': { input: { id: number }; output: RedmineDetails }
+    /**
+     * Sets the status, with an optional comment, and answers with the card read back. A status
+     * the workflow forbids Redmine skips silently, keeping the comment: compare `issue.statusId`.
+     */
+    'redmine.setStatus': {
+      input: { id: number; statusId: number; notes?: string }
+      output: RedmineDetails
+    }
     /** Starts an agent in the issue's worktree; `created` when that worktree was made just now. */
     'redmine.start': {
       input: { id: number }

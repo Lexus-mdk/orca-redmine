@@ -41,13 +41,18 @@ const PROJECTS = {
 /** What Orca lists now; workspace.create adds to it, as the real one does. */
 let workspaces: TestWorkspace[] = [...WORKSPACES]
 
+const STATUS_NAMES: Record<number, string> = { 1: 'Новая', 2: 'В работе', 3: 'Отклонена', 5: 'Закрыта' }
+/** Statuses set through PUT; Redmine reports them from then on. */
+let statusOf = new Map<number, number>()
+let puts: { url: string; body: unknown; type: string | null }[] = []
+
 const apiIssue = (id: number, statusId = 2) => ({
   id,
   subject: `Задача ${id}`,
   description: 'Описание',
   project: { name: 'Демо-проект' },
   tracker: { name: 'Ошибка' },
-  status: { id: statusId, name: statusId === 1 ? 'Новая' : 'В работе' },
+  status: { id: statusOf.get(id) ?? statusId, name: STATUS_NAMES[statusOf.get(id) ?? statusId] },
   priority: { name: 'Нормальный' },
   author: { name: 'Автор' },
   done_ratio: 0,
@@ -66,6 +71,16 @@ const withJournals = (id: number) => ({
   assigned_to: { name: 'Смирнова' },
   ...(id === 14605 ? { parent: { id: 14462 }, children: [{ id: 16001 }, { id: 16003 }] } : {}),
   ...(id === 14700 ? { parent: { id: 900 } } : {}),
+  // 14700 plays a Redmine older than 5.0, which does not list allowed statuses.
+  ...(id === 14700
+    ? {}
+    : {
+        allowed_statuses: [
+          { id: 1, name: 'Новая', is_closed: false },
+          { id: 2, name: 'В работе', is_closed: false },
+          { id: 5, name: 'Закрыта', is_closed: true }
+        ]
+      }),
   description: 'h2. Проблема\r\n\r\nСм. #15363 и @segment_name@',
   attachments: [{ filename: 'scan.png', content_url: `${BASE}/attachments/download/1/scan.png` }],
   journals: [
@@ -95,12 +110,25 @@ function fakeRedmine(acceptedKey = 'good'): void {
     const json = (body: unknown, status = 200) =>
       new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
     if (key !== acceptedKey) return json({}, 401)
+    if (init?.method === 'PUT') {
+      const body = JSON.parse(String(init.body)) as { issue: { status_id: number } }
+      puts.push({ url, body, type: new Headers(init.headers).get('Content-Type') })
+      const id = Number(url.match(/\/issues\/(\d+)\.json$/)?.[1])
+      const wanted = body.issue.status_id
+      if (wanted === 99) return json({ errors: ['Затраченное время не может быть пустым'] }, 422)
+      // Like Redmine, a status the workflow forbids is dropped without an error.
+      if (wanted !== 3) statusOf.set(id, wanted)
+      return new Response(null, { status: 204 })
+    }
     if (url.startsWith(`${BASE}/users/current.json`)) {
       return json({ user: { firstname: 'Анна', lastname: 'Смирнова' } })
     }
     if (url.startsWith(`${BASE}/issues.json?parent_id=~14605&`)) return json({ issues: SUBTREE })
-    if (url.startsWith(`${BASE}/issues.json`)) return json({ issues: assigned })
-    const one = url.match(/\/issues\/(\d+)\.json\?include=journals,attachments,children$/)
+    if (url.startsWith(`${BASE}/issues.json`)) {
+      const open = assigned.map((i) => apiIssue(i.id, i.status.id)).filter((i) => i.status.id !== 5)
+      return json({ issues: open })
+    }
+    const one = url.match(/\/issues\/(\d+)\.json\?include=journals,attachments,children,allowed_statuses$/)
     if (one) return json({ issue: withJournals(Number(one[1])) })
     if (url === `${BASE}/issues/14462.json`) return json({ issue: apiIssue(14462, 1) })
     if (url === `${BASE}/issues/900.json`) return json({}, 403)
@@ -158,6 +186,8 @@ function host(
 
 afterEach(() => {
   globalThis.fetch = realFetch
+  statusOf = new Map()
+  puts = []
   assigned = [apiIssue(14605), apiIssue(14700, 1)]
   workspaces = [...WORKSPACES]
 })
@@ -453,6 +483,54 @@ test('lists statuses in Redmine order, closed ones marked', async () => {
       [2, false],
       [5, true]
     ]
+  )
+  await worker.deactivate()
+})
+
+test('changes the status with a comment, and a closed issue leaves the list', async () => {
+  fakeRedmine()
+  const h = host()
+  const worker = await mountWorker(main, { host: h })
+  await worker.request('redmine.issues', { force: true })
+  const before = await worker.request('redmine.details', { id: 14605 })
+  assert.deepEqual(
+    before.allowedStatuses?.map((s) => [s.id, s.closed]),
+    [
+      [1, false],
+      [2, false],
+      [5, true]
+    ]
+  )
+  assert.equal((await worker.request('redmine.details', { id: 14700 })).allowedStatuses, null)
+
+  const after = await worker.request('redmine.setStatus', { id: 14605, statusId: 5, notes: ' Готово ' })
+  assert.equal(after.issue.status, 'Закрыта')
+  assert.deepEqual(puts, [
+    {
+      url: `${BASE}/issues/14605.json`,
+      body: { issue: { status_id: 5, notes: 'Готово' } },
+      type: 'application/json'
+    }
+  ])
+  // The refresh begun by the write is the one shared here, so it already knows.
+  const snapshot = await worker.request('redmine.issues', { force: true })
+  assert.deepEqual(snapshot.issues.map((i) => i.id), [14700])
+  assert.equal((h.callsOf('statusBar.update').at(-1) as { text: string }).text, 'Redmine: 1')
+  assert.equal(h.callsOf('notifications.show').length, 0)
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+test('a forbidden status comes back unchanged, a validation error is spelled out', async () => {
+  fakeRedmine()
+  const worker = await mountWorker(main, { host: host() })
+  const kept = await worker.request('redmine.setStatus', { id: 14605, statusId: 3 })
+  assert.equal(kept.issue.statusId, 2)
+  // No comment means no notes key, so Redmine adds no empty journal.
+  assert.deepEqual(puts[0].body, { issue: { status_id: 3 } })
+  await assert.rejects(
+    worker.request('redmine.setStatus', { id: 14605, statusId: 99 }),
+    /Redmine не принял изменение: Затраченное время не может быть пустым/
   )
   await worker.deactivate()
 })

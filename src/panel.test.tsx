@@ -4,12 +4,19 @@ import { chunks } from './chunks'
 import * as panel from './panel'
 import type { RedmineDetails, RedmineIssue, RedmineSnapshot } from './protocol'
 
+// Redmine lists "В работе" before "Новая", although its id is larger.
+const STATUSES = [
+  { id: 2, name: 'В работе', closed: false },
+  { id: 1, name: 'Новая', closed: false },
+  { id: 5, name: 'Закрыта', closed: true }
+]
+
 const issue = (id: number, statusId: number, workspaceId: string | null = null): RedmineIssue => ({
   id,
   subject: `Задача ${id}`,
   project: 'Демо-проект',
   tracker: 'Ошибка',
-  status: statusId === 1 ? 'Новая' : 'В работе',
+  status: STATUSES.find((s) => s.id === statusId)?.name ?? '',
   statusId,
   priority: 'Нормальный',
   author: 'Автор',
@@ -31,7 +38,8 @@ const details = (id: number, statusId = 2, workspaceId: string | null = null): R
     { id: 1, author: 'Петров', createdAt: 0, private: false, text: 'Первый комментарий' }
   ],
   commentsTotal: 2,
-  attachments: 0
+  attachments: 0,
+  allowedStatuses: STATUSES
 })
 
 const SNAPSHOT: RedmineSnapshot = {
@@ -39,13 +47,6 @@ const SNAPSHOT: RedmineSnapshot = {
   issues: [issue(14605, 2, 'ws-14605'), issue(14700, 1)],
   fetchedAt: 0
 }
-
-// Redmine lists "В работе" before "Новая", although its id is larger.
-const STATUSES = [
-  { id: 2, name: 'В работе', closed: false },
-  { id: 1, name: 'Новая', closed: false },
-  { id: 5, name: 'Закрыта', closed: true }
-]
 
 const configuredRequests = {
   'redmine.state': () => ({ configured: true, hasKey: true, baseUrl: 'https://redmine.test' }),
@@ -261,6 +262,57 @@ test('groups follow Redmine status order and the order the person sets', async (
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   assert.deepEqual(view.refusals, [])
+})
+
+test('changes the status from the card with a comment', async () => {
+  const sent: { id: number; statusId: number; notes?: string }[] = []
+  view = await mount(panel, {
+    host: mockHost({
+      requests: {
+        ...configuredRequests,
+        'redmine.setStatus': (input) => {
+          sent.push(input)
+          // Redmine bumps updated_on, which lets the card trust this over the older list entry.
+          const next = details(input.id, input.statusId, 'ws-14605')
+          return { ...next, issue: { ...next.issue, updatedAt: 1 } }
+        }
+      }
+    })
+  })
+  await view.press({ label: '#14605 Задача 14605' })
+  await view.press({ role: 'button', text: 'Сменить статус' })
+  const options = view.find({ label: 'Новый статус' })?.props.options as { value: string; label: string }[]
+  // The current status is not offered; a closing one says so.
+  assert.deepEqual(options.map((o) => o.label), ['Новая', 'Закрыта (закрывает задачу)'])
+  assert.equal(view.find({ role: 'button', text: 'Сохранить' })?.props.disabled, true)
+
+  await view.select({ label: 'Новый статус' }, '5')
+  await view.type({ label: 'Комментарий' }, 'Проверено')
+  await view.press({ role: 'button', text: 'Сохранить' })
+  assert.deepEqual(sent, [{ id: 14605, statusId: 5, notes: 'Проверено' }])
+  assert.ok(view.find({ text: '#14605: статус «Закрыта»' }))
+  assert.equal(view.find({ label: 'Новый статус' }), null)
+  assert.ok(view.findAll({ type: 'Badge' }).some((b) => b.text === 'Закрыта'))
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  assert.deepEqual(view.refusals, [])
+})
+
+test('a status the workflow refused keeps the form open and clears the posted comment', async () => {
+  view = await mount(panel, {
+    host: mockHost({
+      requests: { ...configuredRequests, 'redmine.setStatus': ({ id }) => details(id, 2, 'ws-14605') }
+    })
+  })
+  await view.press({ label: '#14605 Задача 14605' })
+  await view.press({ role: 'button', text: 'Сменить статус' })
+  await view.select({ label: 'Новый статус' }, '1')
+  await view.type({ label: 'Комментарий' }, 'Возвращаю')
+  await view.press({ role: 'button', text: 'Сохранить' })
+  assert.ok(view.find({ text: /Redmine оставил статус «В работе», а не «Новая»/ }))
+  assert.ok(view.find({ label: 'Новый статус' }))
+  assert.equal(view.find({ label: 'Комментарий' })?.props.value, '')
+  assert.deepEqual(view.errors, [])
 })
 
 test('shows what the worker throws', async () => {

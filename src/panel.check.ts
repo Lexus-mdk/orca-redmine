@@ -66,7 +66,8 @@ export default defineCheck({
           { id: 1, author: 'Петров Иван', createdAt: 0, private: false, text: 'Нужен замер **до** и после.' }
         ],
         commentsTotal: 2,
-        attachments: 1
+        attachments: 1,
+        allowedStatuses: statuses().statuses
       })
     },
     persisted: { plugin: { selectedId: 14605 } }

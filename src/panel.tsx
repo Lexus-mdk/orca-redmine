@@ -21,12 +21,14 @@ import {
   read,
   RelativeTime,
   Row,
+  Select,
   set,
   shell,
   Skeleton,
   Spinner,
   Stack,
   Text,
+  Textarea,
   type PanelContext
 } from 'orca'
 import { chunks } from './chunks'
@@ -64,6 +66,10 @@ const statuses = atom<RedmineStatus[] | null>(null)
 /** Status ids the person moved up front; the rest follow in Redmine's order. */
 const statusOrder = atom<number[]>('statusOrder', [], { persist: 'plugin' })
 const ordering = atom(false)
+/** The status form of the open card: chosen status id as Select's string, and a comment. */
+const statusEditing = atom(false)
+const statusDraft = atom('')
+const statusNote = atom('')
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -81,7 +87,10 @@ async function load(force = false): Promise<void> {
 
 async function open(id: number): Promise<void> {
   set(selectedId, id)
-  if (read(details)?.issue.id !== id) set(details, null)
+  if (read(details)?.issue.id !== id) {
+    set(details, null)
+    set(statusEditing, false)
+  }
   set(detailsLoading, true)
   set(error, null)
   try {
@@ -99,6 +108,7 @@ function close(): void {
   set(selectedId, null)
   set(details, null)
   set(detailsLoading, false)
+  set(statusEditing, false)
 }
 
 async function loadStatuses(): Promise<void> {
@@ -225,6 +235,52 @@ async function start(issue: RedmineIssue): Promise<void> {
     )
     // The new worktree turns the button into "Продолжить" and shows up in the list.
     if (created) await Promise.all([load(true), read(selectedId) === issue.id ? open(issue.id) : null])
+  } catch (e) {
+    set(error, message(e))
+  } finally {
+    set(busy, null)
+  }
+}
+
+/** Where the issue can go: Redmine's workflow when it says, else every status but the current. */
+function statusChoices(full: RedmineDetails): RedmineStatus[] {
+  const all = full.allowedStatuses ?? read(statuses) ?? []
+  return all.filter((s) => s.id !== full.issue.statusId)
+}
+
+function editStatus(): void {
+  set(statusDraft, '')
+  set(statusNote, '')
+  set(statusEditing, true)
+  if (!read(statuses)) void loadStatuses()
+}
+
+async function saveStatus(issue: RedmineIssue): Promise<void> {
+  const statusId = Number(read(statusDraft))
+  if (!statusId || read(busy) === 'status') return
+  const known = [...(read(details)?.allowedStatuses ?? []), ...(read(statuses) ?? [])]
+  const wanted = known.find((s) => s.id === statusId)?.name
+  set(busy, 'status')
+  set(error, null)
+  set(notice, null)
+  try {
+    const answer = await plugin.request(
+      'redmine.setStatus',
+      { id: issue.id, statusId, notes: read(statusNote) },
+      { timeoutMs: 45_000 }
+    )
+    if (read(selectedId) === issue.id) set(details, answer)
+    // The write went through either way, comment included; a retry must not post it twice.
+    set(statusNote, '')
+    if (answer.issue.statusId === statusId) {
+      set(statusEditing, false)
+      set(notice, `#${issue.id}: статус «${answer.issue.status}»`)
+    } else {
+      set(
+        error,
+        `Redmine оставил статус «${answer.issue.status}»${wanted ? `, а не «${wanted}»` : ''}: переход не разрешён workflow для вашей роли.`
+      )
+    }
   } catch (e) {
     set(error, message(e))
   } finally {
@@ -383,6 +439,58 @@ function Subtasks({ tasks }: { tasks: RedmineSubtask[] }) {
   )
 }
 
+function StatusForm({ issue, full }: { issue: RedmineIssue; full: RedmineDetails }) {
+  const choices = statusChoices(full)
+  const saving = read(busy) === 'status'
+  const cancel = (
+    <Button variant="ghost" disabled={saving} onPress={() => set(statusEditing, false)}>
+      Отмена
+    </Button>
+  )
+  if (choices.length === 0) {
+    return (
+      <Box border radius="md" padding="sm" direction="column" gap="sm">
+        <Text muted size="sm">
+          {full.allowedStatuses
+            ? 'Redmine не даёт вам менять статус этой задачи.'
+            : 'Загружаю статусы…'}
+        </Text>
+        <Row>{cancel}</Row>
+      </Box>
+    )
+  }
+  return (
+    <Box border radius="md" padding="sm" direction="column" gap="sm">
+      <Select
+        label="Новый статус"
+        value={read(statusDraft)}
+        placeholder="Выберите статус"
+        options={choices.map((s) => ({
+          value: String(s.id),
+          label: s.closed ? `${s.name} (закрывает задачу)` : s.name
+        }))}
+        disabled={saving}
+        onChange={(value) => set(statusDraft, value)}
+      />
+      <Textarea
+        label="Комментарий"
+        value={read(statusNote)}
+        placeholder="Необязательно"
+        rows={3}
+        disabled={saving}
+        onChange={(value) => set(statusNote, value)}
+        onSubmit={() => void saveStatus(issue)}
+      />
+      <Row gap="xs">
+        <Button tone="accent" disabled={saving || !read(statusDraft)} onPress={() => saveStatus(issue)}>
+          {saving ? 'Сохраняю…' : 'Сохранить'}
+        </Button>
+        {cancel}
+      </Row>
+    </Box>
+  )
+}
+
 function IssueCard({ issue }: { issue: RedmineIssue }) {
   const starting = read(busy) === 'start'
   const workspaceId = issue.workspaceId
@@ -392,11 +500,18 @@ function IssueCard({ issue }: { issue: RedmineIssue }) {
   return (
     <Card title={`#${issue.id} ${issue.subject}`}>
       <Stack gap="sm">
-        <Row gap="xs" wrap>
+        <Row gap="xs" wrap align="center">
           <Badge tone="accent">{issue.status}</Badge>
           <Badge>{issue.priority}</Badge>
           {workspaceId ? <Badge tone="success">есть workspace</Badge> : null}
+          {/* Allowed statuses come with the details, so the button waits for them. */}
+          {full && !read(statusEditing) ? (
+            <Button size="xs" variant="ghost" icon="edit" onPress={editStatus}>
+              Сменить статус
+            </Button>
+          ) : null}
         </Row>
+        {full && read(statusEditing) ? <StatusForm issue={issue} full={full} /> : null}
         {parent ? (
           <Text size="sm">
             Родительская:{' '}
@@ -600,7 +715,12 @@ export default function Panel() {
   const visible = data ? data.issues.filter((i) => matches(i, text)) : []
   const id = read(selectedId)
   // A number from the search box may not be in the list: then the card comes from details.
-  const selected = data?.issues.find((i) => i.id === id) ?? read(details)?.issue ?? null
+  // Details also win when newer, so a status just changed shows before the list catches up.
+  const listed = data?.issues.find((i) => i.id === id)
+  const loaded = read(details)
+  const fetched = loaded && loaded.issue.id === id ? loaded.issue : undefined
+  const selected =
+    listed && fetched ? (fetched.updatedAt > listed.updatedAt ? fetched : listed) : (listed ?? fetched ?? null)
 
   return (
     <Stack gap="md">

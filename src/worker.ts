@@ -6,6 +6,7 @@ import type {
   RedmineDetails,
   RedmineIssue,
   RedmineSnapshot,
+  RedmineStatus,
   RedmineSubtask
 } from './protocol'
 import { markdownWithIssueLinks, textileToMarkdown, type MarkupContext } from './textile'
@@ -58,6 +59,8 @@ type ApiIssue = {
   done_ratio?: number
   updated_on: string
   closed_on?: string | null
+  /** Redmine 5.0+ with include=allowed_statuses: what the key's owner may switch the issue to. */
+  allowed_statuses?: { id: number; name: string; is_closed?: boolean }[]
   journals?: {
     id: number
     user?: { name: string }
@@ -131,7 +134,13 @@ async function readSettings(orca: OrcaWorkerApi): Promise<Settings> {
 async function redmine<T>(
   orca: OrcaWorkerApi,
   path: string,
-  options: { key?: string; baseUrl?: string; signal?: AbortSignal } = {}
+  options: {
+    key?: string
+    baseUrl?: string
+    signal?: AbortSignal
+    method?: 'GET' | 'PUT'
+    body?: unknown
+  } = {}
 ): Promise<T> {
   const key = options.key ?? (await orca.secrets.get(KEY_SECRET))
   if (!key) fail('API-ключ Redmine не задан')
@@ -142,7 +151,13 @@ async function redmine<T>(
   let response: Response
   try {
     response = await fetch(`${baseUrl}${path}`, {
-      headers: { 'X-Redmine-API-Key': key, Accept: 'application/json' },
+      method: options.method ?? 'GET',
+      headers: {
+        'X-Redmine-API-Key': key,
+        Accept: 'application/json',
+        ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' })
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
       signal
     })
   } catch (error) {
@@ -152,7 +167,17 @@ async function redmine<T>(
   if (response.status === 401) fail('Redmine отклонил API-ключ')
   if (response.status === 403) fail('Нет прав на этот запрос в Redmine')
   if (response.status === 404) fail('Не найдено в Redmine', 404)
+  if (response.status === 422) {
+    // Validation: a required field the new status demands, a closed parent, and the like.
+    const errors = await response
+      .json()
+      .then((body: { errors?: string[] }) => body.errors ?? [])
+      .catch(() => [] as string[])
+    fail(`Redmine не принял изменение${errors.length ? `: ${errors.join('; ')}` : ''}`, 422)
+  }
   if (!response.ok) fail(`Redmine ответил ${response.status}`)
+  // Writes answer 204 with no body.
+  if (response.status === 204) return undefined as T
   try {
     return (await response.json()) as T
   } catch {
@@ -356,6 +381,12 @@ async function relatives(
   return { parent, subtasks }
 }
 
+const toStatus = (s: { id: number; name: string; is_closed?: boolean }): RedmineStatus => ({
+  id: s.id,
+  name: s.name,
+  closed: Boolean(s.is_closed)
+})
+
 function toDetails(
   raw: ApiIssue,
   settings: Settings,
@@ -384,8 +415,45 @@ function toDetails(
     description: toMarkdown(raw.description, DESCRIPTION_LIMIT, settings, ctx),
     comments,
     commentsTotal: notes.length,
-    attachments: raw.attachments?.length ?? 0
+    attachments: raw.attachments?.length ?? 0,
+    allowedStatuses: raw.allowed_statuses ? raw.allowed_statuses.map(toStatus) : null
   }
+}
+
+async function loadDetails(orca: OrcaWorkerApi, id: number, signal?: AbortSignal): Promise<RedmineDetails> {
+  const settings = await readSettings(orca)
+  const [{ issue }, index] = await Promise.all([
+    // Redmine before 5.0 ignores allowed_statuses, and the panel then offers every status.
+    redmine<{ issue: ApiIssue }>(
+      orca,
+      `/issues/${id}.json?include=journals,attachments,children,allowed_statuses`,
+      { signal }
+    ),
+    indexOrEmpty(orca, settings.projectFolder)
+  ])
+  const family = await relatives(orca, issue, signal)
+  return toDetails(issue, settings, workspaceFor(id, index), family)
+}
+
+/**
+ * Writes the status (and an optional comment) and reads the issue back. Redmine drops a status
+ * its workflow does not allow for the role and still answers 204, so the panel compares.
+ */
+async function setStatus(
+  orca: OrcaWorkerApi,
+  input: { id: number; statusId: number; notes?: string },
+  signal: AbortSignal
+): Promise<RedmineDetails> {
+  const notes = (input.notes ?? '').trim()
+  await redmine<void>(orca, `/issues/${input.id}.json`, {
+    method: 'PUT',
+    body: { issue: { status_id: input.statusId, ...(notes ? { notes } : {}) } },
+    signal
+  })
+  // The issue may have left (or joined) the list; a fetch begun before the write must not win.
+  connection++
+  void refresh(orca).catch((e) => orca.log(`refresh after status change failed: ${(e as Error).message}`))
+  return loadDetails(orca, input.id, signal)
 }
 
 async function indexOrEmpty(orca: OrcaWorkerApi, folder: string): Promise<WorkspaceIndex> {
@@ -456,7 +524,8 @@ async function notifyNew(orca: OrcaWorkerApi, snapshot: RedmineSnapshot, notify:
   }
 }
 
-// Bumped when the key or the address changes, so a fetch begun before cannot store its issues after.
+// Bumped when the key, the address or an issue changes, so a fetch begun before cannot store its
+// issues after.
 let connection = 0
 let inflight: { connection: number; promise: Promise<RedmineSnapshot> } | null = null
 
@@ -631,27 +700,15 @@ export default async function activate(orca: OrcaWorkerApi): Promise<void> {
     return refresh(orca)
   })
 
-  orca.panels.handle('redmine.details', async ({ id }, { signal }) => {
-    const settings = await readSettings(orca)
-    const [{ issue }, index] = await Promise.all([
-      redmine<{ issue: ApiIssue }>(
-        orca,
-        `/issues/${id}.json?include=journals,attachments,children`,
-        { signal }
-      ),
-      indexOrEmpty(orca, settings.projectFolder)
-    ])
-    const family = await relatives(orca, issue, signal)
-    return toDetails(issue, settings, workspaceFor(id, index), family)
-  })
+  orca.panels.handle('redmine.details', ({ id }, { signal }) => loadDetails(orca, id, signal))
+
+  orca.panels.handle('redmine.setStatus', (input, { signal }) => setStatus(orca, input, signal))
 
   orca.panels.handle('redmine.statuses', async (_input, { signal }) => {
     const { issue_statuses } = await redmine<{
       issue_statuses: { id: number; name: string; is_closed?: boolean }[]
     }>(orca, '/issue_statuses.json', { signal })
-    return {
-      statuses: issue_statuses.map((s) => ({ id: s.id, name: s.name, closed: Boolean(s.is_closed) }))
-    }
+    return { statuses: issue_statuses.map(toStatus) }
   })
 
   orca.panels.handle('redmine.start', async ({ id }, { signal }) => {

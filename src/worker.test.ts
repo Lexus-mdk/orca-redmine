@@ -98,7 +98,7 @@ const withJournals = (id: number) => ({
 })
 
 let assigned = [apiIssue(14605), apiIssue(14700, 1)]
-let calls: { url: string; key: string | null }[] = []
+let calls: { url: string; key: string | null; redirect?: RequestRedirect }[] = []
 const realFetch = globalThis.fetch
 
 function fakeRedmine(acceptedKey = 'good'): void {
@@ -106,9 +106,16 @@ function fakeRedmine(acceptedKey = 'good'): void {
   globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input)
     const key = new Headers(init?.headers).get('X-Redmine-API-Key')
-    calls.push({ url, key })
+    calls.push({ url, key, redirect: init?.redirect })
     const json = (body: unknown, status = 200) =>
       new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    // The plain-http address moves to https, as a typical Redmine behind nginx does.
+    if (url.startsWith('http://redmine.test/')) {
+      return new Response(null, { status: 301, headers: { Location: url.replace('http://', 'https://') } })
+    }
+    if (url.startsWith('https://moved.test/')) {
+      return new Response(null, { status: 302, headers: { Location: 'https://sso.test/login?back=1' } })
+    }
     if (key !== acceptedKey) return json({}, 401)
     if (init?.method === 'PUT') {
       const body = JSON.parse(String(init.body)) as { issue: { status_id: number } }
@@ -469,6 +476,24 @@ test('keeps the old connection when Redmine rejects a new key or address', async
     baseUrl: BASE
   })
   assert.equal(h.data().secrets?.apiKey, 'good')
+  await worker.deactivate()
+})
+
+test('a redirect is never followed, so the key stays with the address the person entered', async () => {
+  fakeRedmine()
+  const h = host({}, { storage: {} })
+  const worker = await mountWorker(main, { host: h })
+  await assert.rejects(
+    worker.request('redmine.connect', { baseUrl: 'http://redmine.test', key: 'good' }),
+    /http:\/\/redmine\.test перенаправляет на https:\/\/redmine\.test\. Подключитесь по этому адресу/
+  )
+  await assert.rejects(
+    worker.request('redmine.connect', { baseUrl: 'https://moved.test', key: 'good' }),
+    /перенаправляет на https:\/\/sso\.test\/login\?back=1\. Укажите/
+  )
+  assert.ok(calls.length > 0 && calls.every((c) => c.redirect === 'manual'))
+  assert.equal(h.data().secrets?.apiKey, undefined)
+  assert.ok(!calls.some((c) => c.url.includes('sso.test')))
   await worker.deactivate()
 })
 

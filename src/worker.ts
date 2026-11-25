@@ -131,6 +131,25 @@ async function readSettings(orca: OrcaWorkerApi): Promise<Settings> {
   return merged
 }
 
+/** Names the address to connect to instead; usually http:// moved to https:// or a new host. */
+function redirectMessage(baseUrl: string, path: string, response: Response): string {
+  const location = response.headers.get('location')
+  let target = ''
+  try {
+    if (location) target = new URL(location, `${baseUrl}${path}`).toString()
+  } catch {
+    // An unparsable Location still gets the generic message.
+  }
+  if (!target) return `${baseUrl} перенаправляет запрос. Укажите в подключении адрес, по которому Redmine открывается.`
+  // The redirect keeps the API path, so cutting it off leaves the base address to suggest.
+  const pathOnly = path.split('?')[0]
+  const bare = target.split(/[?#]/)[0]
+  const base = bare.endsWith(pathOnly) ? bare.slice(0, -pathOnly.length) : ''
+  return base
+    ? `${baseUrl} перенаправляет на ${base}. Подключитесь по этому адресу (шестерёнка в шапке панели).`
+    : `${baseUrl} перенаправляет на ${target}. Укажите в подключении адрес, по которому Redmine открывается.`
+}
+
 async function redmine<T>(
   orca: OrcaWorkerApi,
   path: string,
@@ -158,12 +177,16 @@ async function redmine<T>(
         ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' })
       },
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      // fetch drops only Authorization on a cross-origin redirect, so following one would hand
+      // the API key to whatever host Redmine (or a proxy in front of it) points at.
+      redirect: 'manual',
       signal
     })
   } catch (error) {
     if (timeout.aborted) fail(`Redmine не ответил за ${REQUEST_TIMEOUT_MS / 1000} с (${baseUrl})`)
     fail(`Нет связи с ${baseUrl}: ${(error as Error).message}`)
   }
+  if (response.status >= 300 && response.status < 400) fail(redirectMessage(baseUrl, path, response))
   if (response.status === 401) fail('Redmine отклонил API-ключ')
   if (response.status === 403) fail('Нет прав на этот запрос в Redmine')
   if (response.status === 404) fail('Не найдено в Redmine', 404)
